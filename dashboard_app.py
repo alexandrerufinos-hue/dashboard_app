@@ -1,32 +1,37 @@
-﻿# -*- coding: utf-8 -*-
-import os, time, datetime as dt
+# -*- coding: utf-8 -*-
+import os, time, io, datetime as dt
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Rufino Trader – Dashboard", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
 APP_TITLE = "Rufino Trader – Painel em Tempo Real"
-CSV_A = os.path.join("log", "trader.csv")     # diário detalhado (novo ou antigo)
-CSV_B = os.path.join("data", "trade_log.csv") # legado simples
 LOCAL_TZ = "America/Fortaleza"
+
+# ---------------------- Caminhos no repositório ----------------------
+# Agora apontam exatamente para as pastas que você citou:
+CSV_A_REPO_PATH = "dashboard_app/log/trader.csv"      # diário detalhado (novo ou antigo)
+CSV_B_REPO_PATH = "dashboard_app/data/trade_log.csv"  # legado simples
+
+# Também tentamos estes caminhos locais (para rodar em dev sem GitHub Raw):
+CSV_A_LOCAL = os.path.join("dashboard_app", "log", "trader.csv")
+CSV_B_LOCAL = os.path.join("dashboard_app", "data", "trade_log.csv")
+
+# ---------------------- Config do GitHub Raw (opcional) ----------------------
+# Informe pelo secrets ou env para ler direto do GitHub (raw.githubusercontent.com)
+REPO_SLUG = st.secrets.get("repo_slug", os.getenv("RT_REPO_SLUG", "")).strip()   # ex: "alexrufino/meu-repo"
+REPO_BRANCH = st.secrets.get("repo_branch", os.getenv("RT_BRANCH", "main")).strip()
+GITHUB_TOKEN = st.secrets.get("github_token", os.getenv("GITHUB_TOKEN", "")).strip()
+
+def _github_raw_url(path_in_repo: str) -> str:
+    # acrescenta um parâmetro anti-cache para forçar atualização
+    ts = int(time.time())
+    return f"https://raw.githubusercontent.com/{REPO_SLUG}/{REPO_BRANCH}/{path_in_repo}?nocache={ts}"
 
 def fmt_brl(x):
     try: return f"R${x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception: return "—"
-
-@st.cache_data(ttl=5.0, show_spinner=False)
-def load_csv_safe(path, expected_cols=None, parse_date_cols=None):
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=expected_cols or [])
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame(columns=expected_cols or [])
-    if parse_date_cols:
-        for c in parse_date_cols:
-            if c in df.columns:
-                df[c] = pd.to_datetime(df[c], errors="coerce")
-    return df
 
 def to_local_naive_datetime(s: pd.Series, tz: str = LOCAL_TZ) -> pd.Series:
     s = pd.to_datetime(s, errors="coerce", utc=True)     # tudo vira UTC-aware
@@ -39,13 +44,55 @@ def pick_col(df: pd.DataFrame, candidates, default=None):
             return df[c]
     return default
 
+@st.cache_data(ttl=5.0, show_spinner=False)
+def load_csv_smart(path_in_repo: str, local_fallback: str, expected_cols=None, parse_date_cols=None) -> pd.DataFrame:
+    """
+    1) Tenta GitHub Raw (se REPO_SLUG definido)
+    2) Cai para arquivo local no container (clone do repo)
+    3) Retorna DataFrame vazio se nada der certo
+    """
+    # 1) GitHub Raw
+    if REPO_SLUG:
+        try:
+            headers = {}
+            if GITHUB_TOKEN:
+                headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+            url = _github_raw_url(path_in_repo)
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.ok and r.text.strip():
+                df = pd.read_csv(io.StringIO(r.text))
+                if parse_date_cols:
+                    for c in parse_date_cols:
+                        if c in df.columns:
+                            df[c] = pd.to_datetime(df[c], errors="coerce")
+                return df
+        except Exception:
+            pass
+
+    # 2) Arquivo local
+    try:
+        # tenta o caminho dentro de dashboard_app/...
+        if os.path.exists(path_in_repo):
+            df = pd.read_csv(path_in_repo)
+        # tenta o fallback local explícito
+        elif os.path.exists(local_fallback):
+            df = pd.read_csv(local_fallback)
+        else:
+            return pd.DataFrame(columns=expected_cols or [])
+        if parse_date_cols:
+            for c in parse_date_cols:
+                if c in df.columns:
+                    df[c] = pd.to_datetime(df[c], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame(columns=expected_cols or [])
+
 # ---------------------- Carregamento ----------------------
-dfa = load_csv_safe(CSV_A)
-dfb = load_csv_safe(CSV_B, parse_date_cols=["datetime"])
+dfa = load_csv_smart(CSV_A_REPO_PATH, CSV_A_LOCAL)
+dfb = load_csv_smart(CSV_B_REPO_PATH, CSV_B_LOCAL, parse_date_cols=["datetime"])
 
 # ---------------------- Normalização A (tolerante a esquemas) ----------------------
 if not dfa.empty:
-    # tenta identificar campos equivalentes
     dt_entry = pick_col(dfa, ["datetime_entry","entry_datetime","entry_time","datetime"])
     symbol   = pick_col(dfa, ["symbol","asset","pair"], "")
     direction= pick_col(dfa, ["direction","dir","signal_dir"], "")
@@ -58,12 +105,10 @@ if not dfa.empty:
     payout   = pd.to_numeric(pick_col(dfa, ["payout","payout_obs"], np.nan), errors="coerce")
     mg_level = pd.to_numeric(pick_col(dfa, ["mg_level","mg","martingale_level"], np.nan), errors="coerce")
     result   = pick_col(dfa, ["result","status","outcome","won"], "")
-    # normaliza 'won' boolean para WIN/LOSS (se veio assim)
-    if result.dtype == bool or set(pd.Series(result).dropna().unique()).issubset({0,1,True,False}):
+    if result is not None and (getattr(result, "dtype", None) == bool or set(pd.Series(result).dropna().unique()).issubset({0,1,True,False})):
         result = pd.Series(np.where(pd.Series(result).astype(float)>0.0, "WIN", "LOSS"))
     won = (pd.Series(result).astype(str).str.upper() == "WIN").astype(float)
 
-    # datas locais/naive
     if dt_entry is not None:
         dt_entry = to_local_naive_datetime(dt_entry)
     dfa_u = pd.DataFrame({
@@ -91,7 +136,7 @@ if not dfb.empty:
     dfb_u = pd.DataFrame({
         "datetime": to_local_naive_datetime(dfb["datetime"]),
         "symbol": dfb.get("asset",""),
-        "direction": "",  # legado não possui direção
+        "direction": "",
         "stake": pd.to_numeric(dfb.get("stake"), errors="coerce"),
         "pnl": pd.to_numeric(dfb.get("pnl"), errors="coerce"),
         "balance": np.nan,
@@ -207,9 +252,9 @@ view = vf[["datetime","symbol","stake","pnl","account_type","strategy","entry_re
 view.columns = ["Data/Hora","Ativo","Stake","PnL","Conta","Estratégia","Referência"]
 st.dataframe(view.tail(300), use_container_width=True)
 
-st.caption("Fontes: log/trader.csv e data/trade_log.csv")
+st.caption("Fontes: dashboard_app/log/trader.csv e dashboard_app/data/trade_log.csv (GitHub Raw se configurado).")
 
 # ---------------------- Auto-refresh ----------------------
-if auto:
+if st.session_state.get("k_auto", True):
     time.sleep(5)
     st.rerun()
